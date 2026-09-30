@@ -1,12 +1,13 @@
 import asyncio
 import shlex
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from app.tools.files import edit_text, glob_files, grep_text, read_text, write_text
-from app.tools.shell import run_shell
+from app.tools.shell import Utf8Decoder, run_shell
 
 
 def test_file_tools_stay_inside_directory(tmp_path: Path):
@@ -28,6 +29,10 @@ def test_file_tools_stay_inside_directory(tmp_path: Path):
     assert written["is_error"] is False
     assert written["before"] == ""
     assert (root / "nested" / "a.txt").read_text(encoding="utf-8") == "hello"
+    assert read_text(root, str(root / "nested" / "a.txt"))["text"] == "hello"
+    absolute = write_text(root, str(root / "nested" / "abs.txt"), "abs")
+    assert absolute["is_error"] is False
+    assert (root / "nested" / "abs.txt").read_text(encoding="utf-8") == "abs"
 
     again = write_text(root, "nested/a.txt", "hello hello")
     assert again["before"] == "hello"
@@ -55,6 +60,14 @@ def test_file_tools_stay_inside_directory(tmp_path: Path):
     found = grep_text(root, r"print\(", "one.py")
     assert found["text"] == "one.py:1:print(1)"
     assert grep_text(root, "[", "one.py")["text"] == "正则无法解析"
+    assert grep_text(root, "print", seconds=0)["text"] == "搜索超时"
+    assert grep_text(root, "print", should_stop=lambda: True)["text"] == "已停止"
+    slow = root / "slow.txt"
+    slow.write_text("a" * 40 + "\n", encoding="utf-8")
+    started = time.monotonic()
+    limited = grep_text(root, r"(a|aa)+b", "slow.txt")
+    assert limited["text"] == "搜索超时"
+    assert time.monotonic() - started < 3
 
 
 async def test_shell_runs_in_session_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -81,6 +94,18 @@ async def test_shell_runs_in_session_directory(tmp_path: Path, monkeypatch: pyte
     assert echoed["text"].startswith("退出码 0")
     assert "hello" in echoed["text"]
     assert (await run_shell(root, "   "))["text"] == "命令为空"
+
+    raw = ("中" * 2000).encode()
+    decoder = Utf8Decoder()
+    text = "".join(decoder.feed(raw[index : index + 4096]) for index in range(0, len(raw), 4096))
+    text += decoder.feed(b"", final=True)
+    assert text == "中" * 2000
+    chinese = await run_shell(root, f"{shlex.quote(sys.executable)} -c {shlex.quote('print(chr(20013)*2000)')}")
+    assert "\ufffd" not in chinese["text"]
+    assert "中" * 100 in chinese["text"]
+    flooded = await run_shell(root, f"{shlex.quote(sys.executable)} -c {shlex.quote('print(chr(20013)*40000)')}")
+    assert "输出已截断" in flooded["text"]
+    assert flooded["text"].count("中") < 40000
 
 
 async def test_shell_timeout_and_stop(tmp_path: Path):

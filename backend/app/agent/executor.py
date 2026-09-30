@@ -36,8 +36,11 @@ async def probe_model(base_url: str, model: str, api_key: str) -> str | None:
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "ping"}],
     }
+    client_kwargs: dict = {"timeout": 20}
+    if _transport is not None:
+        client_kwargs["transport"] = _transport
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.post(url, json=payload, headers=headers)
     except httpx.TimeoutException:
         return "连接超时"

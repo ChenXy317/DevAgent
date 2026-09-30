@@ -1,6 +1,7 @@
 """在会话目录里执行命令。"""
 
 import asyncio
+import codecs
 import contextlib
 import os
 import signal
@@ -9,7 +10,46 @@ from pathlib import Path
 
 
 SHELL_TIMEOUT_SECONDS = 300
+_OUTPUT_LIMIT = 32000
 _HIDDEN = ("API_KEY", "SECRET", "TOKEN", "PASSWORD", "MYSQL_")
+
+
+class Utf8Decoder:
+    """按块解码。一块的末尾可能切在多字节字符中间。"""
+
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def feed(self, data: bytes, *, final: bool = False) -> str:
+        return self._decoder.decode(data, final)
+
+
+class _OutputCapture:
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+        self.total = 0
+        self.truncated = False
+
+    def add(self, text: str) -> str:
+        if not text or self.truncated:
+            return ""
+        room = _OUTPUT_LIMIT - self.total
+        if room <= 0:
+            self.truncated = True
+            marker = "\n...[输出已截断]"
+            self.parts.append(marker)
+            return marker
+        if len(text) <= room:
+            self.parts.append(text)
+            self.total += len(text)
+            return text
+        kept = text[:room]
+        marker = "\n...[输出已截断]"
+        self.parts.append(kept)
+        self.parts.append(marker)
+        self.total += room
+        self.truncated = True
+        return kept + marker
 
 
 def command_env(root: Path) -> dict[str, str]:
@@ -54,19 +94,24 @@ async def run_shell(
     )
     if on_start and process.pid:
         on_start(process.pid)
-    parts: list[str] = []
+    capture = _OutputCapture()
 
     async def pump(stream: asyncio.StreamReader | None) -> None:
         if stream is None:
             return
+        decoder = Utf8Decoder()
         while True:
             data = await stream.read(4096)
             if not data:
+                shown = capture.add(decoder.feed(b"", final=True))
+                if shown and on_output is not None:
+                    await on_output(shown)
                 return
-            text = data.decode("utf-8", errors="replace")
-            parts.append(text)
-            if on_output is not None:
-                await on_output(text)
+            if capture.truncated:
+                continue
+            shown = capture.add(decoder.feed(data))
+            if shown and on_output is not None:
+                await on_output(shown)
 
     async def watch_stop() -> None:
         if stop is None:
@@ -99,7 +144,7 @@ async def run_shell(
         if process.pid:
             kill_group(process.pid, signal.SIGKILL)
         await process.wait()
-    output = "".join(parts).strip()
+    output = "".join(capture.parts).strip()
     if timed_out:
         text = "命令超时" if not output else f"命令超时\n{output}"
         return {"text": text, "is_error": True}

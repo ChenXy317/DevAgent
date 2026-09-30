@@ -7,6 +7,7 @@ from app.agent.context import (
     HistoryMessage,
     build_model_messages,
     clip_text,
+    compression_input,
     summary_messages,
 )
 from app.agent.stream import ToolCallAssembler
@@ -42,10 +43,13 @@ def test_path_jail(tmp_path: Path):
     (root / "link").symlink_to(outside)
 
     assert resolve_inside(root, "note.txt") == (root / "note.txt").resolve()
+    assert resolve_inside(root, str(root / "note.txt")) == (root / "note.txt").resolve()
     with pytest.raises(PathRejected):
         resolve_inside(root, "../outside/secret.txt")
     with pytest.raises(PathRejected):
         resolve_inside(root, str(outside / "secret.txt"))
+    with pytest.raises(PathRejected):
+        resolve_inside(root, str(root / ".." / "outside" / "secret.txt"))
     with pytest.raises(PathRejected):
         resolve_inside(root, "link/secret.txt")
 
@@ -106,6 +110,33 @@ def test_thinking_is_omitted_and_tool_text_is_clipped():
     assert "thinking" not in assistant
     assert assistant["tool_calls"] == [{"id": "c1"}]
     assert clip_text("abcdefghij", 6) == "abc\n...[已截断]...\nhij"
+
+
+def test_compression_input_keeps_tool_calls():
+    huge = "x" * 20000
+    text = compression_input(
+        [
+            message(
+                "1",
+                "assistant",
+                "",
+                tool_calls=[
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "a.py", "content": "' + huge + '"}',
+                        }
+                    }
+                ],
+            ),
+            message("2", "tool", "已写入 a.py"),
+        ]
+    )
+    assert "[工具 write]" in text
+    assert "a.py" in text
+    assert "已写入 a.py" in text
+    assert "已截断" in text
+    assert len(text) < 12000
 
 
 def test_stream_assembler_waits_for_json():

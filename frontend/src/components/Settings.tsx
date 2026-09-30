@@ -100,7 +100,11 @@ export function Settings({ onClose }: { onClose: () => void }) {
     setProbing(true);
     setModelNotice("");
     try {
-      const result = await probeLlm();
+      const result = await probeLlm({
+        base_url: baseUrl.trim(),
+        model: model.trim(),
+        api_key: apiKey,
+      });
       setModelNotice(result.ok ? "连接成功" : result.error || "连接失败");
     } catch (error) {
       setModelNotice(error instanceof Error ? error.message : "连接失败");
@@ -224,6 +228,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
             <input value={turns} onChange={(event) => setTurns(event.target.value)} />
           </label>
           {modelNotice ? <p className="notice">{modelNotice}</p> : null}
+          <p className="muted">测试当前填写的地址和模型。密钥留空时使用已保存的密钥。</p>
           <div className="row">
             <button type="button" onClick={onSave} disabled={saving}>
               {saving ? "保存中" : "保存"}

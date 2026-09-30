@@ -240,7 +240,7 @@ function handleEvent(token: number, event: ServerEvent) {
   }
   if (event.type === "tool.result" && event.tool_call_id) {
     upsertMessage({
-      id: event.tool_call_id,
+      id: event.id || event.tool_call_id,
       role: "tool",
       content: event.text || "",
       thinking: null,

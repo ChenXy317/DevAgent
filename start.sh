@@ -12,7 +12,7 @@ set -a
 source backend/.env
 set +a
 
-if ! mysql --protocol=TCP -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u "${MYSQL_USER}" -p"${MYSQL_PASSWORD}" -D "${MYSQL_DATABASE}" -e "SELECT 1" >/dev/null; then
+if ! mysql --protocol=TCP -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u "${MYSQL_USER}" --password="${MYSQL_PASSWORD}" -D "${MYSQL_DATABASE}" -e "SELECT 1" >/dev/null; then
   echo "无法连接 MySQL。"
   exit 1
 fi

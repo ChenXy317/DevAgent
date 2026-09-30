@@ -92,8 +92,11 @@ export function saveLlm(body: {
   });
 }
 
-export function probeLlm() {
-  return request<{ ok: boolean; error?: string }>("/api/settings/llm/probe", { method: "POST" });
+export function probeLlm(body: { base_url: string; model: string; api_key: string }) {
+  return request<{ ok: boolean; error?: string }>("/api/settings/llm/probe", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 }
 
 export function listRules() {

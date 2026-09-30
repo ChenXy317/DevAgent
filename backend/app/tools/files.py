@@ -1,12 +1,17 @@
 """会话目录内的路径检查和文件工具。"""
 
-import re
+import time
+from collections.abc import Callable
 from pathlib import Path
+
+import regex as regex_lib
 
 
 READ_LIMIT = 50000
 LIST_LIMIT = 200
 _FILE_BYTE_LIMIT = 2_000_000
+_GREP_SECONDS = 30.0
+_LINE_TIMEOUT = 1.0
 
 
 class PathRejected(Exception):
@@ -30,10 +35,11 @@ def resolve_inside(root: Path, raw: str) -> Path:
     if not text:
         raise PathRejected("路径为空")
     candidate = Path(text)
-    if candidate.is_absolute() or ".." in candidate.parts:
+    # `..` 直接拒绝。绝对路径在解析后仍位于会话目录内则放行。
+    if ".." in candidate.parts:
         raise PathRejected("路径越界")
     base = root.resolve()
-    full = (base / candidate).resolve()
+    full = candidate.resolve() if candidate.is_absolute() else (base / candidate).resolve()
     try:
         full.relative_to(base)
     except ValueError as exc:
@@ -169,17 +175,33 @@ def _search_roots(root: Path, raw: object) -> list[Path] | dict:
     return [located]
 
 
-def grep_text(root: Path, pattern: object, raw_path: object = None) -> dict:
+def _search_line(compiled, line: str) -> bool | None:
+    # 单行限时，灾难性回溯不会一直占住线程，停止也能在这一行结束后生效。
+    try:
+        return compiled.search(line, timeout=_LINE_TIMEOUT) is not None
+    except TimeoutError:
+        return None
+
+
+def grep_text(
+    root: Path,
+    pattern: object,
+    raw_path: object = None,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+    seconds: float = _GREP_SECONDS,
+) -> dict:
     if not isinstance(pattern, str) or not pattern:
         return _fail("缺少正则")
     try:
-        regex = re.compile(pattern)
-    except re.error:
+        compiled = regex_lib.compile(pattern)
+    except regex_lib.error:
         return _fail("正则无法解析")
     roots = _search_roots(root, raw_path)
     if isinstance(roots, dict):
         return roots
     root.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + seconds
     lines: list[str] = []
     for start in roots:
         files = [start] if start.is_file() else [path for path in start.rglob("*") if path.is_file()]
@@ -191,7 +213,16 @@ def grep_text(root: Path, pattern: object, raw_path: object = None) -> dict:
                 continue
             relative = path.relative_to(root).as_posix()
             for number, line in enumerate(loaded.splitlines(), start=1):
-                if regex.search(line):
+                if should_stop is not None and should_stop():
+                    return _fail("已停止")
+                if time.monotonic() >= deadline:
+                    return _fail("搜索超时")
+                matched = _search_line(compiled, line)
+                if should_stop is not None and should_stop():
+                    return _fail("已停止")
+                if matched is None:
+                    return _fail("搜索超时")
+                if matched:
                     lines.append(f"{relative}:{number}:{line}")
                     if len(lines) >= LIST_LIMIT:
                         return _ok("\n".join(lines) + "\n已达到 200 条")

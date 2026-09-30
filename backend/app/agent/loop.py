@@ -5,6 +5,8 @@ import contextlib
 import json
 import logging
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 from fastapi import WebSocket
 
@@ -54,6 +56,20 @@ APPROVAL_TOOLS = {"write", "edit", "shell"}
 RULE_KIND = {"write": "write_path", "edit": "edit_path", "shell": "shell_prefix"}
 
 _loops: dict[str, "AgentLoop"] = {}
+
+
+def _run_file_tool(root: Path, name: str, arguments: dict, should_stop: Callable[[], bool]) -> dict:
+    if name == "read":
+        return read_text(root, arguments.get("path"))
+    if name == "write":
+        return write_text(root, arguments.get("path"), arguments.get("content"))
+    if name == "edit":
+        return edit_text(root, arguments.get("path"), arguments.get("old_string"), arguments.get("new_string"))
+    if name == "glob":
+        return glob_files(root, arguments.get("pattern"))
+    if name == "grep":
+        return grep_text(root, arguments.get("pattern"), arguments.get("path"), should_stop=should_stop)
+    return {"text": "未知工具", "is_error": True}
 
 
 def history_from(rows: list[dict]) -> list[HistoryMessage]:
@@ -393,16 +409,18 @@ class AgentLoop:
         for index, call in enumerate(calls):
             call_id = call.call_id or f"call-{index}"
             call.call_id = call_id
+            arguments = "{}" if call.error else (call.raw or "{}")
             payload.append(
                 {
                     "id": call_id,
                     "type": "function",
-                    "function": {"name": call.name or "unknown", "arguments": call.raw or "{}"},
+                    "function": {"name": call.name or "unknown", "arguments": arguments},
                 }
             )
         return payload
 
     async def _run_tools(self, calls: list[ParsedToolCall]) -> str:
+        finished = False
         for index, call in enumerate(calls):
             if self.stop_flag:
                 await self._abort_from(calls, index)
@@ -421,7 +439,8 @@ class AgentLoop:
                     prefix = "" if not self.draft_content or self.draft_content.endswith("\n") else "\n"
                     await self._append_content(f"{prefix}{message}")
                 await self._store_tool(call_id, name, arguments, "已结束", False, "直接执行", None, None)
-                return "finish"
+                finished = True
+                continue
             if name in APPROVAL_TOOLS:
                 status = await self._approve_and_run(call_id, name, arguments)
             else:
@@ -429,7 +448,7 @@ class AgentLoop:
             if status == "stop":
                 await self._abort_from(calls, index + 1)
                 return "stop"
-        return "continue"
+        return "finish" if finished else "continue"
 
     async def _approve_and_run(self, call_id: str, name: str, arguments: dict) -> str:
         matched = await self._rule_match(name, arguments)
@@ -515,16 +534,8 @@ class AgentLoop:
 
     async def _dispatch(self, call_id: str, name: str, arguments: dict) -> dict:
         root = self._root()
-        if name == "read":
-            return read_text(root, arguments.get("path"))
-        if name == "write":
-            return write_text(root, arguments.get("path"), arguments.get("content"))
-        if name == "edit":
-            return edit_text(root, arguments.get("path"), arguments.get("old_string"), arguments.get("new_string"))
-        if name == "glob":
-            return glob_files(root, arguments.get("pattern"))
-        if name == "grep":
-            return grep_text(root, arguments.get("pattern"), arguments.get("path"))
+        if name in {"read", "write", "edit", "glob", "grep"}:
+            return await asyncio.to_thread(_run_file_tool, root, name, arguments, lambda: self.stop_flag)
         if name == "shell":
             async def on_output(text: str) -> None:
                 await self.broadcast({"type": "tool.progress", "tool_call_id": call_id, "text": text})
@@ -595,7 +606,7 @@ class AgentLoop:
         diff = None
         if before is not None:
             diff = {"before": before[:8000], "after": (after or "")[:8000]}
-        await add_message(self.session_id, "tool", visible, tool_call_id=call_id)
+        row = await add_message(self.session_id, "tool", visible, tool_call_id=call_id)
         payload: dict = {"tool_call_id": call_id, "text": visible}
         if diff is not None:
             payload["before"] = diff["before"]
@@ -621,6 +632,7 @@ class AgentLoop:
         await self.broadcast(
             {
                 "type": "tool.result",
+                "id": row["id"],
                 "tool_call_id": call_id,
                 "name": name,
                 "arguments": arguments,

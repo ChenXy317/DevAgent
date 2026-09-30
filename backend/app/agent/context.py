@@ -67,13 +67,36 @@ def summary_messages(
     return [message for turn in older for message in turn]
 
 
+def _render_tool_calls(tool_calls: list) -> str:
+    lines: list[str] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        if not isinstance(function, dict):
+            function = {}
+        name = function.get("name") or "unknown"
+        arguments = function.get("arguments") or ""
+        if not isinstance(arguments, str):
+            arguments = str(arguments)
+        lines.append(f"[工具 {name}] {clip_text(arguments)}")
+    return "\n".join(lines)
+
+
 def compression_input(messages: list[HistoryMessage]) -> str:
     lines: list[str] = []
     for message in messages:
+        parts: list[str] = []
         body = message.content or ""
         if message.role == "tool":
             body = clip_text(body)
-        lines.append(f"{message.role}: {body}")
+        if body:
+            parts.append(body)
+        if message.tool_calls:
+            rendered = _render_tool_calls(message.tool_calls)
+            if rendered:
+                parts.append(rendered)
+        lines.append(f"{message.role}: " + "\n".join(parts))
     return "\n".join(lines)
 
 

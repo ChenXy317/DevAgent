@@ -37,6 +37,12 @@ class RuleCreate(BaseModel):
     pattern: str
 
 
+class LlmProbe(BaseModel):
+    base_url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+
+
 def _raise_known(exc: Exception) -> NoReturn:
     if isinstance(exc, NotFound):
         raise HTTPException(status_code=404, detail="找不到记录") from exc
@@ -113,12 +119,22 @@ async def llm_put(body: LlmUpdate) -> dict:
 
 
 @router.post("/api/settings/llm/probe")
-async def llm_probe() -> dict:
+async def llm_probe(body: LlmProbe | None = None) -> dict:
     try:
         config = await get_llm()
     except NotFound as exc:
         raise HTTPException(status_code=404, detail="模型配置不存在") from exc
-    error = await probe_model(config["base_url"], config["model"], config["api_key"])
+    base_url = config["base_url"]
+    model = config["model"]
+    api_key = config["api_key"]
+    if body is not None:
+        if body.base_url is not None:
+            base_url = body.base_url.strip()
+        if body.model is not None:
+            model = body.model.strip()
+        if body.api_key and body.api_key.strip():
+            api_key = body.api_key.strip()
+    error = await probe_model(base_url, model, api_key)
     if error:
         return {"ok": False, "error": error}
     return {"ok": True}

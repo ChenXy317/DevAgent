@@ -1,5 +1,9 @@
+import json
 import uuid
 
+import httpx
+
+from app.agent.executor import set_transport
 from app.agent.loop import drop_loop, get_loop
 from app.db import get_session_factory
 from app.models import MessageRecord, SessionRecord, utcnow
@@ -91,9 +95,55 @@ async def test_llm_hides_key_and_keeps_blank_update(client):
     )
     assert rejected.status_code == 400
 
+    seen: dict = {}
+
+    def saved_config(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content.decode())
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(503, text="down")
+
+    set_transport(httpx.MockTransport(saved_config))
     probe = await client.post("/api/settings/llm/probe")
     assert probe.status_code == 200
     assert probe.json()["ok"] is False
+    assert "503" in probe.json()["error"]
+    assert seen["body"]["model"] == "demo-2"
+    assert "127.0.0.1" in seen["url"]
+
+    def form_config(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content.decode())
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"choices": []})
+
+    set_transport(httpx.MockTransport(form_config))
+    formed = await client.post(
+        "/api/settings/llm/probe",
+        json={"base_url": "http://form.test/v1", "model": "form-model", "api_key": ""},
+    )
+    assert formed.status_code == 200
+    assert formed.json()["ok"] is True
+    assert seen["body"]["model"] == "form-model"
+    assert "form.test" in seen["url"]
+    assert seen["auth"] == "Bearer secret"
+
+    keyed = await client.post(
+        "/api/settings/llm/probe",
+        json={"base_url": "http://form.test/v1", "model": "form-model", "api_key": "form-key"},
+    )
+    assert keyed.json()["ok"] is True
+    assert seen["auth"] == "Bearer form-key"
+
+    def deny(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(request.url)
+
+    set_transport(httpx.MockTransport(deny))
+    empty = await client.post(
+        "/api/settings/llm/probe",
+        json={"base_url": "http://form.test/v1", "model": " ", "api_key": "x"},
+    )
+    assert empty.json() == {"ok": False, "error": "请先填写模型"}
 
 
 async def test_allow_rules(client):

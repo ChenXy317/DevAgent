@@ -278,7 +278,19 @@ async def test_compress_keeps_recent_turns_and_failure_is_stable(client):
     await configure(client, turns=2)
     session_id, loop, sent = await open_session(client)
     await add_message(session_id, "user", "第一轮目标")
-    await add_message(session_id, "assistant", "已经决定", thinking="隐藏的思考")
+    await add_message(
+        session_id,
+        "assistant",
+        "已经决定",
+        thinking="隐藏的思考",
+        tool_calls=[
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "write", "arguments": '{"path": "a.py"}'},
+            }
+        ],
+    )
     await add_message(session_id, "user", "第二轮过程")
     await add_message(session_id, "assistant", "第二轮回复")
     await add_message(session_id, "user", "第三轮保留")
@@ -291,6 +303,8 @@ async def test_compress_keeps_recent_turns_and_failure_is_stable(client):
     user_input = script.bodies[0]["messages"][1]["content"]
     assert "tools" not in script.bodies[0]
     assert "第一轮目标" in user_input
+    assert "write" in user_input
+    assert "a.py" in user_input
     assert "第二轮回复" in user_input
     assert "第三轮保留" not in user_input
     assert "隐藏的思考" not in json.dumps(script.bodies[0], ensure_ascii=False)
@@ -345,6 +359,65 @@ async def test_compress_keeps_recent_turns_and_failure_is_stable(client):
     assert kept["summary"] == "旧总结"
     assert kept["compacted_before_id"] == older[-1].id
     assert any(item.get("message", "").startswith("接口返回 500") for item in sent if item["type"] == "error")
+    await shutdown_loop(session_id)
+
+
+async def test_finish_task_runs_the_rest_of_the_batch(client):
+    await configure(client)
+    session_id, loop, sent = await open_session(client)
+    root = session_directory(get_settings().workdir_path(), session_id)
+    root.mkdir()
+    (root / "hello.txt").write_text("内容", encoding="utf-8")
+    script = Script(
+        [
+            [
+                tool_call("f1", "finish_task", {"message": "收工"}, 0),
+                tool_call("r1", "read", {"path": "hello.txt"}, 1),
+            ],
+            [{"content": "不应再请求"}],
+        ]
+    )
+    script.install()
+    await loop.on_user_message("结束")
+    await loop.queue.join()
+    assert len(script.bodies) == 1
+    tools = [item for item in sent if item["type"] == "tool.result"]
+    assert [item["name"] for item in tools] == ["finish_task", "read"]
+    assert "内容" in tools[1]["text"]
+    rows = await list_messages(session_id)
+    by_call = {row["tool_call_id"]: row["id"] for row in rows if row.get("tool_call_id")}
+    assert tools[1]["id"] == by_call["r1"]
+    assert any(row["role"] == "assistant" and "收工" in row["content"] for row in rows)
+    assert loop.state == "done"
+    await shutdown_loop(session_id)
+
+
+async def test_broken_arguments_are_stored_as_object(client):
+    await configure(client)
+    session_id, loop, sent = await open_session(client)
+    script = Script(
+        [
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "bad",
+                            "function": {"name": "read", "arguments": "{"},
+                        }
+                    ]
+                }
+            ],
+            [{"content": "继续"}],
+        ]
+    )
+    script.install()
+    await loop.on_user_message("读一下")
+    await loop.queue.join()
+    assert len(script.bodies) == 2
+    assistant = next(item for item in script.bodies[1]["messages"] if item.get("tool_calls"))
+    assert assistant["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert any("参数无法解析" in item.get("text", "") for item in sent if item["type"] == "tool.result")
     await shutdown_loop(session_id)
 
 
