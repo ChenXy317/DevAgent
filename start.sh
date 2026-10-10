@@ -24,12 +24,12 @@ free_port() {
   fi
 }
 
-free_port 8000
-free_port 5173
+free_port 8001
+free_port 5174
 
-uv run --directory backend uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1 &
+uv run --directory backend uvicorn app.main:app --host 127.0.0.1 --port 8001 --workers 1 &
 back_pid=$!
-npm --prefix frontend run dev -- --host 127.0.0.1 --port 5173 &
+npm --prefix frontend run dev -- --host 127.0.0.1 --port 5174 &
 front_pid=$!
 
 cleanup() {

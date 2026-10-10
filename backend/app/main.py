@@ -7,7 +7,7 @@ from app.api.rest import router as rest_router
 from app.api.ws import router as ws_router
 from app.db import dispose_db, init_db
 
-ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173"]
+ORIGINS = ["http://127.0.0.1:5174", "http://localhost:5174"]
 
 
 @asynccontextmanager

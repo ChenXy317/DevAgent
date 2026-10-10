@@ -16,12 +16,6 @@ import { ApprovalModal } from "./ApprovalModal";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallCard } from "./ToolCallCard";
 
-const EXAMPLES = [
-  "列出工作目录里的文件",
-  "写一个 hello.py，内容是打印 hello",
-  "搜索 Python asyncio 队列的文档",
-];
-
 const RUN_LABEL: Record<string, string> = {
   idle: "空闲",
   running: "运行中",
@@ -222,17 +216,9 @@ export function Chat({
             ))}
           </details>
         ) : null}
-        {agent.messages.length === 0 && !agent.live && agent.liveTools.length === 0 && !agent.loadingMessages ? (
-          <div className="examples">
-            {EXAMPLES.map((example) => (
-              <button key={example} type="button" onClick={() => sendText(example)}>
-                {example}
-              </button>
-            ))}
-          </div>
-        ) : (
-          recent.map((message) => <MessageView key={message.id} message={message} />)
-        )}
+        {recent.map((message) => (
+          <MessageView key={message.id} message={message} />
+        ))}
         {agent.live ? <MessageView message={agent.live} /> : null}
         {agent.liveTools.map((tool) => (
           <LiveToolView key={tool.id} tool={tool} />

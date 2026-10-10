@@ -45,7 +45,7 @@ export function openSessionSocket(
 ): SessionSocket {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(
-    `${protocol}//${window.location.host}/ws?session_id=${encodeURIComponent(sessionId)}`,
+    `${protocol}://${window.location.host}/ws?session_id=${encodeURIComponent(sessionId)}`,
   );
   onStatus("connecting");
   socket.onopen = () => onStatus("open");

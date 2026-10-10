@@ -150,13 +150,6 @@ h2 { font-size: 15px; font-weight: 600; }
   padding: 16px;
 }
 
-.examples {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 8px;
-}
-
 .bubble, .tool-card, .approval, .thinking {
   border: 1px solid var(--border);
   padding: 10px 12px;
