@@ -5,6 +5,7 @@ import {
   canCompress,
   requestCompress,
   requestStop,
+  rewindTo,
   selectSession,
   sendDecision,
   sendText,
@@ -61,7 +62,13 @@ function decisionLabel(message: { decision?: string; prefix?: string }) {
   return message.decision || "";
 }
 
-function MessageView({ message }: { message: ChatMessage }) {
+function MessageView({
+  message,
+  onRewind,
+}: {
+  message: ChatMessage;
+  onRewind?: () => void;
+}) {
   if (message.role === "tool") {
     return (
       <ToolCallCard
@@ -79,6 +86,11 @@ function MessageView({ message }: { message: ChatMessage }) {
     <article className={`bubble ${message.role}`}>
       {message.thinking ? <ThinkingBlock text={message.thinking} /> : null}
       {message.content ? <p>{message.content}</p> : null}
+      {message.role === "user" && onRewind ? (
+        <button type="button" className="rewind-button" onClick={onRewind}>
+          回退
+        </button>
+      ) : null}
     </article>
   );
 }
@@ -104,6 +116,14 @@ export function Chat({
   const stick = useRef(true);
   const wasCompressing = useRef(false);
   const running = agent.runState === "running" || agent.runState === "awaiting_approval";
+  function rewind(messageId: string) {
+    if (running || agent.compressing) {
+      return;
+    }
+    if (window.confirm("回退到这条消息之前。之后的写入会撤掉，命令不会撤")) {
+      void rewindTo(messageId);
+    }
+  }
   const compressEnabled = canCompress();
   const compressTitle = agent.compressing
     ? "正在压缩"
@@ -164,6 +184,11 @@ export function Chat({
         <strong className="title">{title}</strong>
         <span>{CONNECTION_LABEL[agent.connection]}</span>
         <span>{RUN_LABEL[agent.runState] ?? agent.runState}</span>
+        {agent.contextChars !== null ? (
+          <span>
+            {agent.contextChars} / {agent.contextLimit ?? agent.llm?.context_limit ?? 0}
+          </span>
+        ) : null}
         <button type="button" disabled={!compressEnabled} title={compressTitle} onClick={requestCompress}>
           {agent.compressing ? "正在压缩" : "压缩上下文"}
         </button>
@@ -212,12 +237,28 @@ export function Chat({
             <summary>已压缩的历史</summary>
             {summaryText ? <p>{summaryText}</p> : null}
             {older.map((message) => (
-              <MessageView key={message.id} message={message} />
+              <MessageView
+                key={message.id}
+                message={message}
+                onRewind={
+                  message.role === "user" && !running && !agent.compressing
+                    ? () => rewind(message.id)
+                    : undefined
+                }
+              />
             ))}
           </details>
         ) : null}
         {recent.map((message) => (
-          <MessageView key={message.id} message={message} />
+          <MessageView
+            key={message.id}
+            message={message}
+            onRewind={
+              message.role === "user" && !running && !agent.compressing
+                ? () => rewind(message.id)
+                : undefined
+            }
+          />
         ))}
         {agent.live ? <MessageView message={agent.live} /> : null}
         {agent.liveTools.map((tool) => (

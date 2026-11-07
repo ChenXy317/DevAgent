@@ -19,6 +19,7 @@ def system_prompt(workdir: str, has_summary: bool) -> str:
 def compression_prompt() -> str:
     return (
         "根据记录写一份能接着干活的纪要。"
+        "记录里如果有已有总结，就和后面的新记录合成一份。"
         "覆盖：用户目标、已做决定、改过的文件、命令结果、未完成的事项、仍然有效的约束。"
         "不要写成对用户的寒暄。"
     )

@@ -14,6 +14,7 @@ from app.persist import (
     delete_rule,
     delete_session,
     get_llm,
+    rewind_session,
     get_session,
     list_messages,
     list_rules,
@@ -25,11 +26,19 @@ from app.persist import (
 router = APIRouter()
 
 
+class SessionCreate(BaseModel):
+    workdir: str = ""
+
+
+class RewindBody(BaseModel):
+    message_id: str
+
+
 class LlmUpdate(BaseModel):
     base_url: str = ""
     model: str = ""
     api_key: str | None = None
-    context_turns: int = 20
+    context_limit: int = 100_000
 
 
 class RuleCreate(BaseModel):
@@ -64,8 +73,24 @@ async def sessions_list() -> list[dict]:
 
 
 @router.post("/api/sessions")
-async def sessions_create() -> dict:
-    return await create_session()
+async def sessions_create(body: SessionCreate | None = None) -> dict:
+    try:
+        return await create_session(body.workdir if body is not None else "")
+    except BadRequest as exc:
+        _raise_known(exc)
+
+
+@router.post("/api/sessions/{session_id}/rewind")
+async def sessions_rewind(session_id: str, body: RewindBody) -> dict:
+    loop = peek_loop(session_id)
+    if loop is not None and (
+        loop.compressing or loop.state in {"running", "awaiting_approval"} or loop.busy.locked()
+    ):
+        raise HTTPException(status_code=409, detail="正在运行")
+    try:
+        return await rewind_session(session_id, body.message_id)
+    except (NotFound, BadRequest) as exc:
+        _raise_known(exc)
 
 
 @router.get("/api/sessions/{session_id}")
@@ -113,7 +138,7 @@ async def llm_get() -> dict:
 @router.put("/api/settings/llm")
 async def llm_put(body: LlmUpdate) -> dict:
     try:
-        return await update_llm(body.base_url, body.model, body.api_key, body.context_turns)
+        return await update_llm(body.base_url, body.model, body.api_key, body.context_limit)
     except (NotFound, BadRequest) as exc:
         _raise_known(exc)
 

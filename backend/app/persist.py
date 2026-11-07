@@ -3,10 +3,13 @@ import shutil
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.agent.context import MAX_CONTEXT_LIMIT, MIN_CONTEXT_LIMIT
+from app.agent.rewind import RevertStep, RewindError, apply_reverts, restore_snapshots
 from app.config import get_settings
 from app.db import get_session_factory
 from app.models import (
@@ -17,7 +20,7 @@ from app.models import (
     ToolLogRecord,
     utcnow,
 )
-from app.tools.files import session_directory
+from app.tools.files import PathRejected, resolve_bound_directory, session_directory
 
 RULE_KINDS = {"shell_prefix", "write_path", "edit_path"}
 LOG_LIMIT = 32000
@@ -54,6 +57,7 @@ def session_dict(row: SessionRecord) -> dict:
         "title": row.title,
         "summary": row.summary,
         "compacted_before_id": row.compacted_before_id,
+        "workdir": row.workdir or "",
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
     }
@@ -89,10 +93,23 @@ async def list_sessions() -> list[dict]:
         return [session_dict(row) for row in rows]
 
 
-async def create_session() -> dict:
+async def create_session(workdir: str | None = None) -> dict:
+    bound = None
+    if workdir and workdir.strip():
+        try:
+            bound = str(resolve_bound_directory(workdir, get_settings().projects_root_path()))
+        except PathRejected as exc:
+            raise BadRequest(exc.message) from exc
     factory = get_session_factory()
     now = utcnow()
-    row = SessionRecord(id=str(uuid.uuid4()), title="", summary="", created_at=now, updated_at=now)
+    row = SessionRecord(
+        id=str(uuid.uuid4()),
+        title="",
+        summary="",
+        workdir=bound,
+        created_at=now,
+        updated_at=now,
+    )
     async with factory() as db:
         db.add(row)
         await db.commit()
@@ -127,8 +144,11 @@ async def delete_session(session_id: str) -> None:
         ).all()
         for message in messages:
             await db.delete(message)
+        bound = row.workdir or ""
         await db.delete(row)
         await db.commit()
+    if bound:
+        return
     directory = session_directory(get_settings().workdir_path(), session_id)
     if directory.exists():
         shutil.rmtree(directory)
@@ -277,6 +297,9 @@ async def add_tool_log(
     is_error: bool,
     decision: str,
     duration_ms: int | None = None,
+    tool_call_id: str | None = None,
+    revert_before: str | None = None,
+    revert_existed: bool | None = None,
 ) -> None:
     factory = get_session_factory()
     row = ToolLogRecord(
@@ -288,6 +311,9 @@ async def add_tool_log(
         is_error=is_error,
         decision=decision,
         duration_ms=duration_ms,
+        tool_call_id=tool_call_id,
+        revert_before=revert_before,
+        revert_existed=revert_existed,
         created_at=utcnow(),
     )
     async with factory() as db:
@@ -305,7 +331,7 @@ async def get_llm() -> dict:
             "base_url": row.base_url,
             "model": row.model,
             "api_key": row.api_key,
-            "context_turns": row.context_turns,
+            "context_limit": row.context_limit,
         }
 
 
@@ -314,7 +340,7 @@ def llm_public(row: dict) -> dict:
         "base_url": row["base_url"],
         "model": row["model"],
         "api_key_set": bool(row["api_key"]),
-        "context_turns": row["context_turns"],
+        "context_limit": row["context_limit"],
     }
 
 
@@ -330,14 +356,14 @@ async def update_llm(
     base_url: str,
     model: str,
     api_key: str | None,
-    context_turns: int,
+    context_limit: int,
 ) -> dict:
     if not base_url.strip():
         raise BadRequest("请填写模型地址")
     if not model.strip():
         raise BadRequest("请填写模型名")
-    if context_turns < 1 or context_turns > 200:
-        raise BadRequest("轮数需要在 1 到 200 之间")
+    if context_limit < MIN_CONTEXT_LIMIT or context_limit > MAX_CONTEXT_LIMIT:
+        raise BadRequest(f"上下文上限需要在 {MIN_CONTEXT_LIMIT} 到 {MAX_CONTEXT_LIMIT} 之间")
     factory = get_session_factory()
     async with factory() as db:
         row = await db.get(LlmConfigRecord, 1)
@@ -345,7 +371,7 @@ async def update_llm(
             raise NotFound()
         row.base_url = base_url.strip()
         row.model = model.strip()
-        row.context_turns = context_turns
+        row.context_limit = context_limit
         row.updated_at = utcnow()
         if api_key:
             row.api_key = api_key
@@ -355,7 +381,7 @@ async def update_llm(
                 "base_url": row.base_url,
                 "model": row.model,
                 "api_key": row.api_key,
-                "context_turns": row.context_turns,
+                "context_limit": row.context_limit,
             }
         )
 
@@ -393,3 +419,107 @@ async def delete_rule(rule_id: int) -> None:
             raise NotFound()
         await db.delete(row)
         await db.commit()
+
+
+def _logged_call_id(row: ToolLogRecord) -> str | None:
+    if row.tool_call_id:
+        return row.tool_call_id
+    try:
+        payload = json.loads(row.result)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("tool_call_id"), str) and payload["tool_call_id"]:
+        return payload["tool_call_id"]
+    return None
+
+
+def _arg(arguments: dict | None, key: str) -> str:
+    if not isinstance(arguments, dict):
+        return ""
+    value = arguments.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+async def rewind_session(session_id: str, message_id: str) -> dict:
+    factory = get_session_factory()
+    async with factory() as db:
+        session = await db.get(SessionRecord, session_id)
+        if session is None:
+            raise NotFound()
+        messages = (
+            await db.scalars(
+                select(MessageRecord)
+                .where(MessageRecord.session_id == session_id)
+                .order_by(MessageRecord.created_at.asc(), MessageRecord.id.asc())
+            )
+        ).all()
+        pivot = next((item for item in messages if item.id == message_id), None)
+        if pivot is None:
+            raise BadRequest("找不到这条消息")
+        if pivot.role != "user":
+            raise BadRequest("只能回退到用户消息")
+        later: list[MessageRecord] = []
+        seen = False
+        for item in messages:
+            if seen:
+                later.append(item)
+            elif item.id == pivot.id:
+                seen = True
+        later_calls = {item.tool_call_id for item in later if item.tool_call_id}
+        logs = (
+            await db.scalars(
+                select(ToolLogRecord)
+                .where(ToolLogRecord.session_id == session_id)
+                .order_by(ToolLogRecord.created_at.asc(), ToolLogRecord.id.asc())
+            )
+        ).all()
+        matched = [log for log in logs if (call_id := _logged_call_id(log)) and call_id in later_calls]
+        steps: list[RevertStep] = []
+        skipped: list[str] = []
+        for log in matched:
+            path = _arg(log.arguments, "path")
+            if log.tool_name == "shell":
+                skipped.append(f"命令未撤销: {_arg(log.arguments, 'command') or '命令'}")
+                continue
+            if log.tool_name not in {"write", "edit"} or log.is_error:
+                continue
+            if log.revert_existed is None or log.revert_before is None or not path:
+                label = "修改未撤销" if log.tool_name == "edit" else "写入未撤销"
+                skipped.append(f"{label}: {path or '文件'}")
+                continue
+            steps.append(RevertStep(path=path, existed=bool(log.revert_existed), before=log.revert_before))
+        steps.reverse()
+        if session.workdir:
+            root = Path(session.workdir)
+            if not root.is_dir():
+                raise BadRequest("绑定的目录不存在")
+        else:
+            root = session_directory(get_settings().workdir_path(), session_id)
+            root.mkdir(parents=True, exist_ok=True)
+        try:
+            restored, snapshots = apply_reverts(root, steps)
+        except RewindError as exc:
+            raise BadRequest(exc.message) from exc
+        deleted_ids = {item.id for item in later}
+        if session.compacted_before_id and session.compacted_before_id in deleted_ids:
+            session.compacted_before_id = None
+            session.summary = ""
+            await db.flush()
+        for log in matched:
+            await db.delete(log)
+        for item in later:
+            await db.delete(item)
+        session.updated_at = utcnow()
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            restore_snapshots(snapshots)
+            raise
+        return {
+            "ok": True,
+            "restored": restored,
+            "skipped": skipped,
+            "summary": session.summary or "",
+            "compacted_before_id": session.compacted_before_id,
+        }

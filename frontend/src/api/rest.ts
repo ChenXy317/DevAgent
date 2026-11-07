@@ -5,6 +5,7 @@ export type Session = {
   compacted_before_id: string | null;
   created_at: string;
   updated_at: string;
+  workdir: string;
 };
 
 export type ChatMessage = {
@@ -27,7 +28,7 @@ export type LlmSettings = {
   base_url: string;
   model: string;
   api_key_set: boolean;
-  context_turns: number;
+  context_limit: number;
 };
 
 export type AllowRule = {
@@ -64,8 +65,24 @@ export function listSessions() {
   return request<Session[]>("/api/sessions");
 }
 
-export function createSession() {
-  return request<Session>("/api/sessions", { method: "POST" });
+export function createSession(workdir = "") {
+  return request<Session>("/api/sessions", {
+    method: "POST",
+    body: JSON.stringify({ workdir }),
+  });
+}
+
+export function rewindSession(id: string, messageId: string) {
+  return request<{
+    ok: boolean;
+    restored: string[];
+    skipped: string[];
+    summary: string;
+    compacted_before_id: string | null;
+  }>(`/api/sessions/${id}/rewind`, {
+    method: "POST",
+    body: JSON.stringify({ message_id: messageId }),
+  });
 }
 
 export function deleteSession(id: string) {
@@ -84,7 +101,7 @@ export function saveLlm(body: {
   base_url: string;
   model: string;
   api_key: string;
-  context_turns: number;
+  context_limit: number;
 }) {
   return request<LlmSettings>("/api/settings/llm", {
     method: "PUT",

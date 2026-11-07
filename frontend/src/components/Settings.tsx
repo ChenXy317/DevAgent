@@ -30,7 +30,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const [baseUrl, setBaseUrl] = useState("");
   const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [turns, setTurns] = useState("20");
+  const [limit, setLimit] = useState("100000");
   const [rules, setRules] = useState<AllowRule[]>([]);
   const [kind, setKind] = useState<(typeof KINDS)[number][0]>("shell_prefix");
   const [pattern, setPattern] = useState("");
@@ -49,7 +49,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
         }
         setBaseUrl(llm.base_url);
         setModel(llm.model);
-        setTurns(String(llm.context_turns));
+        setLimit(String(llm.context_limit));
         setRules(nextRules);
         refreshLlm(llm);
       })
@@ -72,9 +72,9 @@ export function Settings({ onClose }: { onClose: () => void }) {
       setModelNotice("请填写模型名");
       return;
     }
-    const contextTurns = Number(turns);
-    if (!Number.isInteger(contextTurns) || contextTurns < 1 || contextTurns > 200) {
-      setModelNotice("轮数需要在 1 到 200 之间");
+    const contextLimit = Number(limit);
+    if (!Number.isInteger(contextLimit) || contextLimit < 20000 || contextLimit > 2000000) {
+      setModelNotice("上下文上限需要在 20000 到 2000000 之间");
       return;
     }
     setSaving(true);
@@ -84,7 +84,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
         base_url: baseUrl.trim(),
         model: model.trim(),
         api_key: apiKey,
-        context_turns: contextTurns,
+        context_limit: contextLimit,
       });
       refreshLlm(saved);
       setApiKey("");
@@ -224,9 +224,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
             />
           </label>
           <label>
-            保留轮数
-            <input value={turns} onChange={(event) => setTurns(event.target.value)} />
+            上下文上限
+            <input value={limit} onChange={(event) => setLimit(event.target.value)} />
           </label>
+          <p className="muted">单位是字符。达到上限的 90% 时先压缩，再继续当前任务。</p>
           {modelNotice ? <p className="notice">{modelNotice}</p> : null}
           <p className="muted">测试当前填写的地址和模型。密钥留空时使用已保存的密钥。</p>
           <div className="row">

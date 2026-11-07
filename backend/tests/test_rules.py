@@ -8,8 +8,11 @@ from app.agent.context import (
     build_model_messages,
     clip_text,
     compression_input,
-    summary_messages,
+    messages_to_fold,
+    over_auto_threshold,
+    payload_chars,
 )
+from app.agent.executor import is_context_length_error
 from app.agent.stream import ToolCallAssembler
 from app.permissions.gate import ApprovalGate
 from app.permissions.policy import path_allowed, shell_allowed, shell_prefix
@@ -56,20 +59,46 @@ def test_path_jail(tmp_path: Path):
 
 def test_context_window_and_compaction():
     history = [
-        message("1", "user", "第一轮"),
+        message("1", "user", "第一轮" + "甲" * 400),
         message("2", "assistant", "好"),
         message("3", "user", "第二轮"),
         message("4", "user", "第三轮"),
         message("5", "user", "第四轮"),
     ]
-    assert summary_messages(history, 4) is None
-    older = summary_messages(history, 2)
-    assert older is not None
-    assert [item.id for item in older] == ["1", "2", "3"]
+    full = build_model_messages(
+        history,
+        context_limit=100_000,
+        compacted_before_id=None,
+        system="系统",
+        summary="",
+        tools=[],
+    )
+    packed = build_model_messages(
+        history,
+        context_limit=payload_chars(full[-2:], None),
+        compacted_before_id=None,
+        system="系统",
+        summary="",
+        tools=[],
+    )
+    packed_text = " ".join(item["content"] for item in packed)
+    assert "第四轮" in packed_text
+    assert "第一轮" not in packed_text
+
+    folded = messages_to_fold(
+        history,
+        compacted_before_id=None,
+        context_limit=payload_chars(full[-2:], None),
+        system="系统",
+        tools=[],
+    )
+    assert folded is not None
+    assert folded[-1].id != "5"
+    assert "第一轮" in folded[0].content
 
     payload = build_model_messages(
         history,
-        context_turns=2,
+        context_limit=100_000,
         compacted_before_id="3",
         system="系统",
         summary="已经做过第一轮和第二轮",
@@ -80,17 +109,8 @@ def test_context_window_and_compaction():
     assert "第一轮" not in contents
     assert "第三轮" in contents
     assert "第四轮" in contents
-
-    widened = build_model_messages(
-        history,
-        context_turns=20,
-        compacted_before_id="3",
-        system="系统",
-        summary="总结",
-    )
-    widened_text = " ".join(item["content"] for item in widened)
-    assert "第一轮" not in widened_text
-    assert "第三轮" in widened_text
+    assert over_auto_threshold(900, 1000)
+    assert not over_auto_threshold(899, 1000)
 
 
 def test_thinking_is_omitted_and_tool_text_is_clipped():
@@ -101,7 +121,7 @@ def test_thinking_is_omitted_and_tool_text_is_clipped():
     ]
     payload = build_model_messages(
         history,
-        context_turns=5,
+        context_limit=100_000,
         compacted_before_id=None,
         system="系统",
         summary="",
@@ -137,6 +157,20 @@ def test_compression_input_keeps_tool_calls():
     assert "已写入 a.py" in text
     assert "已截断" in text
     assert len(text) < 12000
+    with_summary = compression_input(
+        [message("3", "user", "后来的记录")],
+        previous_summary="旧纪要",
+    )
+    assert with_summary.startswith("已有总结:\n旧纪要")
+    assert "后来的记录" in with_summary
+
+
+def test_context_length_error_detects_provider_text():
+    assert is_context_length_error("接口返回 400：context_length_exceeded")
+    assert is_context_length_error("This model's maximum context length is 8192 tokens")
+    assert is_context_length_error("上下文长度超出限制")
+    assert not is_context_length_error("接口返回 401：invalid api key")
+    assert not is_context_length_error("模型请求超时")
 
 
 def test_stream_assembler_waits_for_json():

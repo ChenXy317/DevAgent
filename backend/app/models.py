@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import JSON
@@ -25,6 +25,7 @@ class SessionRecord(Base):
         ForeignKey("messages.id", use_alter=True, name="fk_sessions_compacted_before"),
         nullable=True,
     )
+    workdir: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -53,6 +54,9 @@ class ToolLogRecord(Base):
     is_error: Mapped[bool] = mapped_column(default=False)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     decision: Mapped[str] = mapped_column(String(32), default="")
+    tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    revert_before: Mapped[str | None] = mapped_column(MEDIUMTEXT, nullable=True)
+    revert_existed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -74,6 +78,7 @@ class LlmConfigRecord(Base):
     model: Mapped[str] = mapped_column(String(200), default="")
     api_key: Mapped[str] = mapped_column(Text, default="")
     context_turns: Mapped[int] = mapped_column(Integer, default=20)
+    context_limit: Mapped[int] = mapped_column(Integer, default=100_000)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 

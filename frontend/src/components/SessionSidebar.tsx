@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import type { Session } from "../api/rest";
 
 export function SessionSidebar({
@@ -18,19 +20,35 @@ export function SessionSidebar({
   loading: boolean;
   error: string;
   deletingId: string | null;
-  onCreate: () => void;
+  onCreate: (workdir: string) => void;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
   onRetry: () => void;
 }) {
+  const [path, setPath] = useState("");
   return (
     <aside className="sidebar">
       <div className="sidebar-head">
         <h1>会话</h1>
-        <button type="button" onClick={onCreate} disabled={creating}>
+        <button
+          type="button"
+          onClick={() => {
+            onCreate(path.trim());
+            setPath("");
+          }}
+          disabled={creating}
+        >
           {creating ? "创建中" : "新建"}
         </button>
       </div>
+      <label className="sidebar-path">
+        目录
+        <input
+          value={path}
+          placeholder="可留空"
+          onChange={(event) => setPath(event.target.value)}
+        />
+      </label>
       {loading ? <p className="muted">加载中</p> : null}
       {error ? (
         <p className="notice">
@@ -58,7 +76,10 @@ export function SessionSidebar({
                 className="text-button"
                 disabled={deleting}
                 onClick={() => {
-                  if (window.confirm("删除这个会话和工作目录中的文件")) {
+                  const text = session.workdir
+                    ? "删除这个会话。绑定的目录不会删除"
+                    : "删除这个会话和工作目录中的文件";
+                  if (window.confirm(text)) {
                     onDelete(session.id);
                   }
                 }}

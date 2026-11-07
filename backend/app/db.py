@@ -47,7 +47,33 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 async def init_db() -> None:
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_columns)
     await ensure_llm_config()
+
+
+def _has_column(sync_conn, table: str, column: str) -> bool:
+    row = sync_conn.exec_driver_sql(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '"
+        + table
+        + "' AND COLUMN_NAME = '"
+        + column
+        + "'"
+    ).scalar()
+    return int(row or 0) > 0
+
+
+def _ensure_columns(sync_conn) -> None:
+    alters = [
+        ("llm_config", "context_limit", "ALTER TABLE llm_config ADD COLUMN context_limit INTEGER NOT NULL DEFAULT 100000"),
+        ("sessions", "workdir", "ALTER TABLE sessions ADD COLUMN workdir VARCHAR(1000) NULL"),
+        ("tool_logs", "tool_call_id", "ALTER TABLE tool_logs ADD COLUMN tool_call_id VARCHAR(128) NULL"),
+        ("tool_logs", "revert_before", "ALTER TABLE tool_logs ADD COLUMN revert_before MEDIUMTEXT NULL"),
+        ("tool_logs", "revert_existed", "ALTER TABLE tool_logs ADD COLUMN revert_existed TINYINT(1) NULL"),
+    ]
+    for table, column, sql in alters:
+        if not _has_column(sync_conn, table, column):
+            sync_conn.exec_driver_sql(sql)
 
 
 async def ensure_llm_config() -> None:
@@ -63,6 +89,7 @@ async def ensure_llm_config() -> None:
                     model=settings.llm_model,
                     api_key=settings.llm_api_key,
                     context_turns=20,
+                    context_limit=100_000,
                     updated_at=utcnow(),
                 )
             )

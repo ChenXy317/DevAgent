@@ -6,6 +6,7 @@ import {
   listMessages,
   listSessions,
   readLlm,
+  rewindSession,
   type ChatMessage,
   type LlmSettings,
   type Session,
@@ -42,6 +43,8 @@ type AgentState = {
   compactedBeforeId: string | null;
   compressing: boolean;
   compressDraft: string;
+  contextChars: number | null;
+  contextLimit: number | null;
   live: ChatMessage | null;
   liveTools: LiveTool[];
 };
@@ -66,6 +69,8 @@ let state: AgentState = {
   compactedBeforeId: null,
   compressing: false,
   compressDraft: "",
+  contextChars: null,
+  contextLimit: null,
   live: null,
   liveTools: [],
 };
@@ -99,10 +104,15 @@ function turnCount(messages: ChatMessage[]) {
   return count;
 }
 
+const AUTO_COMPACT_NOTICE = "上下文已到上限的 90%，正在压缩";
+
 export function canCompress() {
-  const turns = state.llm?.context_turns ?? 20;
   const busy = state.runState === "running" || state.runState === "awaiting_approval" || state.compressing;
-  return !busy && turnCount(state.messages) > turns;
+  const pivot = state.compactedBeforeId
+    ? state.messages.findIndex((message) => message.id === state.compactedBeforeId)
+    : -1;
+  const recent = pivot >= 0 ? state.messages.slice(pivot + 1) : state.messages;
+  return !busy && turnCount(recent) > 1;
 }
 
 function patchSession(id: string, patch: Partial<Session>) {
@@ -162,6 +172,8 @@ function handleEvent(token: number, event: ServerEvent) {
       liveTools: [],
       compressing: false,
       compressDraft: "",
+      contextChars: event.context_chars ?? state.contextChars,
+      contextLimit: event.context_limit ?? state.contextLimit,
       loadingMessages: false,
       messageError: "",
       notice: reconnecting ? "已重新连接" : transient.has(state.notice) ? "" : state.notice,
@@ -277,7 +289,11 @@ function handleEvent(token: number, event: ServerEvent) {
     return;
   }
   if (event.type === "compress.start") {
-    setState({ compressing: true, compressDraft: "" });
+    setState({
+      compressing: true,
+      compressDraft: "",
+      notice: event.auto ? AUTO_COMPACT_NOTICE : state.notice,
+    });
     return;
   }
   if (event.type === "compress.delta") {
@@ -288,6 +304,7 @@ function handleEvent(token: number, event: ServerEvent) {
     setState({
       compressing: false,
       compressDraft: "",
+      notice: state.notice === AUTO_COMPACT_NOTICE ? "" : state.notice,
       summary: event.summary || "",
       compactedBeforeId: event.compacted_before_id ?? state.compactedBeforeId,
       sessions: state.currentId
@@ -301,6 +318,13 @@ function handleEvent(token: number, event: ServerEvent) {
   }
   if (event.type === "session.deleted" && state.currentId) {
     setState({ sessions: state.sessions.filter((session) => session.id !== state.currentId) });
+    return;
+  }
+  if (event.type === "context.usage") {
+    setState({
+      contextChars: event.chars ?? state.contextChars,
+      contextLimit: event.limit ?? state.contextLimit,
+    });
     return;
   }
   if (event.type === "error") {
@@ -368,6 +392,8 @@ export async function selectSession(id: string) {
     compactedBeforeId: current?.compacted_before_id ?? null,
     compressing: false,
     compressDraft: "",
+    contextChars: null,
+    contextLimit: state.llm?.context_limit ?? state.contextLimit,
     live: null,
     liveTools: [],
   });
@@ -389,10 +415,10 @@ export async function selectSession(id: string) {
   }
 }
 
-export async function newSession() {
+export async function newSession(workdir = "") {
   setState({ creating: true, sessionError: "" });
   try {
-    const session = await createSession();
+    const session = await createSession(workdir);
     setState({ sessions: [session, ...state.sessions], creating: false });
     await selectSession(session.id);
   } catch (error) {
@@ -439,8 +465,37 @@ export async function removeSession(id: string) {
   }
 }
 
+export async function rewindTo(messageId: string) {
+  if (!state.currentId) {
+    return;
+  }
+  try {
+    const result = await rewindSession(state.currentId, messageId);
+    const messages = await listMessages(state.currentId);
+    const parts = ["已回退"];
+    if (result.restored.length > 0) {
+      parts.push(`已恢复 ${result.restored.join("、")}`);
+    }
+    if (result.skipped.length > 0) {
+      parts.push(result.skipped.join("；"));
+    }
+    setState({
+      messages,
+      summary: result.summary,
+      compactedBeforeId: result.compacted_before_id,
+      notice: parts.join("。"),
+      sessions: patchSession(state.currentId, {
+        summary: result.summary,
+        compacted_before_id: result.compacted_before_id,
+      }),
+    });
+  } catch (error) {
+    setState({ notice: error instanceof Error ? error.message : "回退失败" });
+  }
+}
+
 export function refreshLlm(llm: LlmSettings) {
-  setState({ llm });
+  setState({ llm, contextLimit: llm.context_limit });
 }
 
 export function sendText(text: string) {

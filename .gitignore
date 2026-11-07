@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .env
 .test-workspace/
+.test-projects/
 node_modules/
 dist/
 workspace/*

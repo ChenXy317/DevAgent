@@ -24,6 +24,11 @@ export type ServerEvent = {
   decision?: string;
   prefix?: string;
   diff?: { before: string; after: string } | null;
+  auto?: boolean;
+  chars?: number;
+  limit?: number;
+  context_chars?: number;
+  context_limit?: number;
 };
 
 export type ApprovalRequest = {

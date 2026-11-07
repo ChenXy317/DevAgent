@@ -25,8 +25,8 @@ export function App() {
           loading={agent.loadingSessions}
           error={agent.sessionError}
           deletingId={agent.deletingId}
-          onCreate={() => {
-            void newSession();
+          onCreate={(path) => {
+            void newSession(path);
             setSidebarOpen(false);
           }}
           onSelect={(id) => {

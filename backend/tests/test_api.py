@@ -72,26 +72,27 @@ async def test_delete_session_with_compacted_message(client):
 async def test_llm_hides_key_and_keeps_blank_update(client):
     saved = await client.put(
         "/api/settings/llm",
-        json={"base_url": "http://127.0.0.1:9/v1", "model": "demo", "api_key": "secret", "context_turns": 20},
+        json={"base_url": "http://127.0.0.1:9/v1", "model": "demo", "api_key": "secret", "context_limit": 100000},
     )
     assert saved.status_code == 200
     body = saved.json()
     assert body["api_key_set"] is True
+    assert body["context_limit"] == 100000
     assert "secret" not in saved.text
     assert await read_llm_secret() == "secret"
 
     kept = await client.put(
         "/api/settings/llm",
-        json={"base_url": "http://127.0.0.1:9/v1", "model": "demo-2", "api_key": "", "context_turns": 8},
+        json={"base_url": "http://127.0.0.1:9/v1", "model": "demo-2", "api_key": "", "context_limit": 80000},
     )
     assert kept.status_code == 200
     assert kept.json()["model"] == "demo-2"
-    assert kept.json()["context_turns"] == 8
+    assert kept.json()["context_limit"] == 80000
     assert await read_llm_secret() == "secret"
 
     rejected = await client.put(
         "/api/settings/llm",
-        json={"base_url": "http://127.0.0.1:9/v1", "model": "demo-2", "context_turns": 0},
+        json={"base_url": "http://127.0.0.1:9/v1", "model": "demo-2", "context_limit": 0},
     )
     assert rejected.status_code == 400
 

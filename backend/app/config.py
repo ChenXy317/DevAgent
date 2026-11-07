@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     search_api_key: str = ""
     workdir: str = "./workspace"
+    projects_root: str = ""
 
     model_config = SettingsConfigDict(
         env_file=str(BACKEND_DIR / ".env"),
@@ -26,6 +27,12 @@ class Settings(BaseSettings):
 
     def workdir_path(self) -> Path:
         raw = Path(self.workdir)
+        if not raw.is_absolute():
+            raw = REPO_ROOT / raw
+        return raw.resolve()
+
+    def projects_root_path(self) -> Path:
+        raw = Path(self.projects_root).expanduser() if self.projects_root.strip() else Path.home() / "Projects"
         if not raw.is_absolute():
             raw = REPO_ROOT / raw
         return raw.resolve()

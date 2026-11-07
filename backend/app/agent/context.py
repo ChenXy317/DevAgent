@@ -1,9 +1,14 @@
-"""按轮裁剪送给模型的历史，并算出压缩时留下的结尾。"""
+"""按字符上限装入要发送的上下文，并选出压缩时移出的轮次。"""
 
+import json
 from dataclasses import dataclass, field
 
 
 TOOL_RESULT_LIMIT = 8000
+DEFAULT_CONTEXT_LIMIT = 100_000
+MIN_CONTEXT_LIMIT = 20_000
+MAX_CONTEXT_LIMIT = 2_000_000
+AUTO_COMPACT_PERCENT = 90
 
 
 @dataclass
@@ -50,21 +55,110 @@ def after_compaction(
     return list(messages)
 
 
-def recent_messages(messages: list[HistoryMessage], context_turns: int) -> list[HistoryMessage]:
-    if context_turns < 1:
-        return []
-    kept = split_turns(messages)[-context_turns:]
-    return [message for turn in kept for message in turn]
+def payload_chars(messages: list[dict], tools: list | None) -> int:
+    encoded = json.dumps(messages, ensure_ascii=False)
+    if tools is not None:
+        encoded += json.dumps(tools, ensure_ascii=False)
+    return len(encoded)
 
 
-def summary_messages(
-    messages: list[HistoryMessage], context_turns: int
+def _flat(turns: list[list[HistoryMessage]]) -> list[HistoryMessage]:
+    return [message for turn in turns for message in turn]
+
+
+def assemble_messages(
+    selected: list[HistoryMessage],
+    *,
+    system: str,
+    summary: str,
+    pending: list[HistoryMessage] | None = None,
+) -> list[dict]:
+    payload = [{"role": "system", "content": system}]
+    if summary.strip():
+        payload.append({"role": "system", "content": summary})
+    payload.extend(to_api_message(message) for message in selected)
+    payload.extend(to_api_message(message) for message in pending or [])
+    return payload
+
+
+def measure_messages(
+    selected: list[HistoryMessage],
+    *,
+    system: str,
+    summary: str,
+    tools: list | None,
+    pending: list[HistoryMessage] | None = None,
+) -> int:
+    return payload_chars(
+        assemble_messages(selected, system=system, summary=summary, pending=pending),
+        tools,
+    )
+
+
+def context_occupancy(
+    messages: list[HistoryMessage],
+    *,
+    compacted_before_id: str | None,
+    system: str,
+    summary: str,
+    tools: list | None,
+) -> int:
+    visible_summary = summary if compacted_before_id and summary.strip() else ""
+    post = after_compaction(messages, compacted_before_id)
+    return measure_messages(post, system=system, summary=visible_summary, tools=tools)
+
+
+def over_auto_threshold(occupancy: int, context_limit: int) -> bool:
+    return occupancy * 100 >= context_limit * AUTO_COMPACT_PERCENT
+
+
+def pack_turns(
+    turns: list[list[HistoryMessage]],
+    *,
+    context_limit: int,
+    system: str,
+    summary: str,
+    tools: list | None,
+) -> list[HistoryMessage]:
+    chosen: list[list[HistoryMessage]] = []
+    for turn in reversed(turns):
+        candidate = [turn, *chosen]
+        size = measure_messages(_flat(candidate), system=system, summary=summary, tools=tools)
+        if size <= context_limit or not chosen:
+            chosen = candidate
+            if size > context_limit:
+                break
+        else:
+            break
+    return _flat(chosen)
+
+
+def messages_to_fold(
+    messages: list[HistoryMessage],
+    *,
+    compacted_before_id: str | None,
+    context_limit: int,
+    system: str,
+    tools: list | None,
 ) -> list[HistoryMessage] | None:
-    turns = split_turns(messages)
-    if len(turns) <= context_turns:
+    post = after_compaction(messages, compacted_before_id)
+    turns = split_turns(post)
+    if len(turns) < 2:
         return None
-    older = turns[:-context_turns]
-    return [message for turn in older for message in turn]
+    target = max(1, context_limit // 2)
+    kept = [turns[-1]]
+    for turn in reversed(turns[:-1]):
+        candidate = [turn, *kept]
+        size = measure_messages(_flat(candidate), system=system, summary="", tools=tools)
+        if size <= target:
+            kept = candidate
+        else:
+            break
+    kept_ids = {message.id for message in _flat(kept)}
+    dropped = [message for message in post if message.id not in kept_ids]
+    if not dropped:
+        return None
+    return dropped
 
 
 def _render_tool_calls(tool_calls: list) -> str:
@@ -83,8 +177,10 @@ def _render_tool_calls(tool_calls: list) -> str:
     return "\n".join(lines)
 
 
-def compression_input(messages: list[HistoryMessage]) -> str:
+def compression_input(messages: list[HistoryMessage], previous_summary: str = "") -> str:
     lines: list[str] = []
+    if previous_summary.strip():
+        lines.append("已有总结:\n" + previous_summary.strip())
     for message in messages:
         parts: list[str] = []
         body = message.content or ""
@@ -97,7 +193,7 @@ def compression_input(messages: list[HistoryMessage]) -> str:
             if rendered:
                 parts.append(rendered)
         lines.append(f"{message.role}: " + "\n".join(parts))
-    return "\n".join(lines)
+    return "\n\n".join(lines) if previous_summary.strip() else "\n".join(lines)
 
 
 def to_api_message(message: HistoryMessage) -> dict:
@@ -120,16 +216,19 @@ def to_api_message(message: HistoryMessage) -> dict:
 def build_model_messages(
     messages: list[HistoryMessage],
     *,
-    context_turns: int,
+    context_limit: int,
     compacted_before_id: str | None,
     system: str,
     summary: str,
+    tools: list | None = None,
     pending: list[HistoryMessage] | None = None,
 ) -> list[dict]:
-    selected = recent_messages(after_compaction(messages, compacted_before_id), context_turns)
-    payload = [{"role": "system", "content": system}]
-    if compacted_before_id and summary.strip():
-        payload.append({"role": "system", "content": summary})
-    payload.extend(to_api_message(message) for message in selected)
-    payload.extend(to_api_message(message) for message in pending or [])
-    return payload
+    visible_summary = summary if compacted_before_id and summary.strip() else ""
+    selected = pack_turns(
+        split_turns(after_compaction(messages, compacted_before_id)),
+        context_limit=context_limit,
+        system=system,
+        summary=visible_summary,
+        tools=tools,
+    )
+    return assemble_messages(selected, system=system, summary=visible_summary, pending=pending)

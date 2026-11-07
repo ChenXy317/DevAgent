@@ -4,6 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 os.environ["MYSQL_DATABASE"] = "coding_agent_test"
 os.environ["WORKDIR"] = str(ROOT / ".test-workspace")
+os.environ["PROJECTS_ROOT"] = str(ROOT / ".test-projects")
 
 from datetime import datetime, timezone
 
@@ -26,6 +27,7 @@ async def reset_llm() -> None:
         row.model = ""
         row.api_key = ""
         row.context_turns = 20
+        row.context_limit = 100_000
         await db.commit()
 
 

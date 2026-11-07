@@ -20,6 +20,29 @@ class PathRejected(Exception):
         self.message = message
 
 
+def resolve_bound_directory(raw: str, projects: Path) -> Path:
+    text = raw.strip()
+    if not text:
+        raise PathRejected("路径为空")
+    candidate = Path(text).expanduser()
+    base = projects.resolve()
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise PathRejected("目录不存在") from exc
+    if not resolved.is_dir():
+        raise PathRejected("不是目录")
+    if resolved == base:
+        raise PathRejected("不能绑定项目根目录")
+    try:
+        resolved.relative_to(base)
+    except ValueError as exc:
+        raise PathRejected("目录必须在允许的项目根下面") from exc
+    return resolved
+
+
 def session_directory(root: Path, session_id: str) -> Path:
     if not session_id or "/" in session_id or "\\" in session_id or session_id in {".", ".."}:
         raise PathRejected("会话无效")
@@ -97,14 +120,15 @@ def write_text(root: Path, raw: object, content: object) -> dict:
         return located
     if located.exists() and located.is_dir():
         return _fail("这是目录")
+    existed = located.is_file()
     before = ""
-    if located.is_file():
+    if existed:
         loaded = _read_utf8(located)
         before = loaded if isinstance(loaded, str) else ""
     located.parent.mkdir(parents=True, exist_ok=True)
     located.write_text(content, encoding="utf-8")
     shown = raw.strip() if isinstance(raw, str) else ""
-    return _ok(f"已写入 {shown}", before=before, after=content)
+    return _ok(f"已写入 {shown}", before=before, after=content, existed=existed)
 
 
 def edit_text(root: Path, raw: object, old: object, new: object) -> dict:
@@ -128,7 +152,7 @@ def edit_text(root: Path, raw: object, old: object, new: object) -> dict:
     updated = loaded.replace(old, new, 1)
     located.write_text(updated, encoding="utf-8")
     shown = raw.strip() if isinstance(raw, str) else ""
-    return _ok(f"已修改 {shown}", before=loaded, after=updated)
+    return _ok(f"已修改 {shown}", before=loaded, after=updated, existed=True)
 
 
 def _inside_file(root: Path, path: Path) -> bool:

@@ -158,6 +158,20 @@ h2 { font-size: 15px; font-weight: 600; }
 
 .bubble.user { background: var(--panel); }
 
+.sidebar-path {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.sidebar-path input { width: 100%; }
+
+.rewind-button {
+  margin-top: 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+}
+
 .bubble p,
 .folded > p {
   white-space: pre-wrap;

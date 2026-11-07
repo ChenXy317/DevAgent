@@ -15,9 +15,11 @@ from app.agent.context import (
     build_model_messages,
     clip_text,
     compression_input,
-    summary_messages,
+    context_occupancy,
+    messages_to_fold,
+    over_auto_threshold,
 )
-from app.agent.executor import ModelError, RunStopped, stream_chat
+from app.agent.executor import ModelError, RunStopped, is_context_length_error, stream_chat
 from app.agent.prompts import compression_prompt, system_prompt
 from app.agent.stream import ParsedToolCall, ToolCallAssembler
 from app.config import get_settings
@@ -135,6 +137,7 @@ class AgentLoop:
         self.stop_flag = False
         self.stop_event = asyncio.Event()
         self.compressing = False
+        self.autocompact_paused = False
         self.shell_pid: int | None = None
         self.approval_timeout = 120.0
         self.shell_timeout = float(SHELL_TIMEOUT_SECONDS)
@@ -155,7 +158,10 @@ class AgentLoop:
         self.state = state
         await self.broadcast({"type": "agent.state", "state": state})
 
-    def _root(self):
+    async def _root(self) -> Path:
+        session = await get_session(self.session_id)
+        if session and session.get("workdir"):
+            return Path(session["workdir"])
         root = session_directory(get_settings().workdir_path(), self.session_id)
         root.mkdir(parents=True, exist_ok=True)
         return root
@@ -191,6 +197,10 @@ class AgentLoop:
         }
         if self.gate.request is not None:
             payload["approval"] = self.gate.request
+        usage = await self._context_usage()
+        if usage is not None:
+            payload["context_chars"] = usage["chars"]
+            payload["context_limit"] = usage["limit"]
         return payload
 
     async def on_user_message(self, text: str) -> None:
@@ -240,10 +250,11 @@ class AgentLoop:
         has_summary = bool((session["summary"] or "").strip() and session["compacted_before_id"])
         return build_model_messages(
             history,
-            context_turns=config["context_turns"],
+            context_limit=int(config["context_limit"]),
             compacted_before_id=session["compacted_before_id"],
-            system=system_prompt(str(self._root()), has_summary),
+            system=system_prompt(str(await self._root()), has_summary),
             summary=session["summary"] or "",
+            tools=TOOLS,
         )
 
     async def _drain(self) -> None:
@@ -281,6 +292,7 @@ class AgentLoop:
                 "title": row["title"],
             }
         )
+        self.autocompact_paused = False
         await self._set_state("running")
         for _ in range(MAX_ROUNDS):
             if self.stop_flag:
@@ -294,6 +306,8 @@ class AgentLoop:
                 return
             status = await self._run_tools(calls)
             if status == "stop":
+                if self.state == "running":
+                    await self._set_state("idle")
                 return
             if status == "finish":
                 await self._set_state("done")
@@ -329,20 +343,42 @@ class AgentLoop:
         )
 
     async def _one_completion(self) -> list[ParsedToolCall] | None:
+        compact = await self._compact_now("auto")
+        if compact == "stop":
+            await self._set_state("idle")
+            return None
+        return await self._complete_round(allow_overflow_retry=True)
+
+    async def _complete_round(
+        self,
+        *,
+        allow_overflow_retry: bool,
+        row: dict | None = None,
+        content: list[str] | None = None,
+        thinking: list[str] | None = None,
+    ) -> list[ParsedToolCall] | None:
         config = await get_llm()
         messages = await self.model_messages()
         if not messages:
             await self.broadcast({"type": "error", "message": "会话不存在"})
             await self._set_state("error")
             return None
-        row = await add_message(self.session_id, "assistant", "")
-        self.draft_id = row["id"]
-        self.draft_content = ""
-        await self.broadcast(
-            {"type": "message.start", "id": row["id"], "role": "assistant", "created_at": row["created_at"]}
-        )
-        content: list[str] = []
-        thinking: list[str] = []
+        if row is None:
+            row = await add_message(self.session_id, "assistant", "")
+            content = []
+            thinking = []
+            self.draft_id = row["id"]
+            self.draft_content = ""
+            await self.broadcast(
+                {"type": "message.start", "id": row["id"], "role": "assistant", "created_at": row["created_at"]}
+            )
+        else:
+            content = content if content is not None else []
+            thinking = thinking if thinking is not None else []
+            content.clear()
+            thinking.clear()
+            self.draft_content = ""
+        assert content is not None and thinking is not None
         assembler = ToolCallAssembler()
 
         async def on_delta(delta: dict) -> None:
@@ -378,21 +414,25 @@ class AgentLoop:
                 stop=self.stop_event,
             )
         except RunStopped:
-            text = "".join(content)
-            text = f"{text}\n已停止" if text else "已停止"
-            self.draft_content = text
-            thought = "".join(thinking)
-            await update_message(row["id"], content=text, thinking=thought or None)
-            await self._done_message(row, text, thought, None)
-            await self._set_state("idle")
+            await self._stop_draft(row, content, thinking)
             return None
         except ModelError as exc:
-            thought = "".join(thinking)
-            self.draft_content = exc.message
-            await update_message(row["id"], content=exc.message, thinking=thought or None)
-            await self._done_message(row, exc.message, thought, None)
-            await self.broadcast({"type": "error", "message": exc.message})
-            await self._set_state("error")
+            if allow_overflow_retry and is_context_length_error(exc.message):
+                retry = await self._compact_now("overflow")
+                if retry == "stop":
+                    await self._stop_draft(row, content, thinking)
+                    return None
+                if retry == "done":
+                    return await self._complete_round(
+                        allow_overflow_retry=False,
+                        row=row,
+                        content=content,
+                        thinking=thinking,
+                    )
+                exc = ModelError("上下文过长，已停止")
+            elif not allow_overflow_retry and is_context_length_error(exc.message):
+                exc = ModelError("上下文仍然过长，已停止")
+            await self._fail_draft(row, exc.message, thinking)
             return None
 
         calls = assembler.finish()
@@ -403,6 +443,23 @@ class AgentLoop:
         await update_message(row["id"], content=text, thinking=thought or None, tool_calls=api_calls)
         await self._done_message(row, text, thought, api_calls)
         return calls
+
+    async def _stop_draft(self, row: dict, content: list[str], thinking: list[str]) -> None:
+        text = "".join(content)
+        text = f"{text}\n已停止" if text else "已停止"
+        self.draft_content = text
+        thought = "".join(thinking)
+        await update_message(row["id"], content=text, thinking=thought or None)
+        await self._done_message(row, text, thought, None)
+        await self._set_state("idle")
+
+    async def _fail_draft(self, row: dict, message: str, thinking: list[str]) -> None:
+        thought = "".join(thinking)
+        self.draft_content = message
+        await update_message(row["id"], content=message, thinking=thought or None)
+        await self._done_message(row, message, thought, None)
+        await self.broadcast({"type": "error", "message": message})
+        await self._set_state("error")
 
     def _api_calls(self, calls: list[ParsedToolCall]) -> list[dict]:
         payload = []
@@ -432,6 +489,9 @@ class AgentLoop:
             await self._tool_start(call_id, name, arguments if not call.error else {})
             if call.error:
                 await self._store_tool(call_id, name, {}, call.error, True, "直接执行", None, None)
+                if await self._after_tool() == "stop":
+                    await self._abort_from(calls, index + 1)
+                    return "stop"
                 continue
             if name == "finish_task":
                 message = str(arguments.get("message") or "")
@@ -440,6 +500,9 @@ class AgentLoop:
                     await self._append_content(f"{prefix}{message}")
                 await self._store_tool(call_id, name, arguments, "已结束", False, "直接执行", None, None)
                 finished = True
+                if await self._after_tool() == "stop":
+                    await self._abort_from(calls, index + 1)
+                    return "stop"
                 continue
             if name in APPROVAL_TOOLS:
                 status = await self._approve_and_run(call_id, name, arguments)
@@ -471,6 +534,8 @@ class AgentLoop:
             label = "超时" if decision == "timeout" else "拒绝"
             await self._store_tool(call_id, name, arguments, text, True, label, None, None)
             await self._set_state("running")
+            if await self._after_tool() == "stop":
+                return "stop"
             return "continue"
         saved_prefix = None
         if decision == "approve_always" and prefix:
@@ -526,14 +591,23 @@ class AgentLoop:
             duration,
             result.get("before"),
             result.get("after"),
+            result.get("existed") if isinstance(result.get("existed"), bool) else None,
         )
         if self.stop_flag:
             await self._set_state("idle")
             return "stop"
+        if await self._after_tool() == "stop":
+            return "stop"
         return "continue"
 
+    async def _after_tool(self) -> str:
+        if self.stop_flag:
+            await self._set_state("idle")
+            return "stop"
+        return await self._compact_now("auto")
+
     async def _dispatch(self, call_id: str, name: str, arguments: dict) -> dict:
-        root = self._root()
+        root = await self._root()
         if name in {"read", "write", "edit", "glob", "grep"}:
             return await asyncio.to_thread(_run_file_tool, root, name, arguments, lambda: self.stop_flag)
         if name == "shell":
@@ -601,6 +675,7 @@ class AgentLoop:
         duration: int | None,
         before: str | None = None,
         after: str | None = None,
+        existed: bool | None = None,
     ) -> None:
         visible = text if len(text) <= 32000 else clip_text(text, 32000)
         diff = None
@@ -620,6 +695,8 @@ class AgentLoop:
                 payload["before"] = str(payload["before"])[: max(200, len(str(payload["before"])) // 2)]
                 payload["after"] = str(payload["after"])[: max(200, len(str(payload["after"])) // 2)]
             raw = json.dumps(payload, ensure_ascii=False)
+        revert_before = before if before is not None and isinstance(existed, bool) and not is_error else None
+        revert_existed = existed if revert_before is not None else None
         await add_tool_log(
             self.session_id,
             name,
@@ -628,6 +705,9 @@ class AgentLoop:
             is_error=is_error,
             decision=decision,
             duration_ms=duration,
+            tool_call_id=call_id,
+            revert_before=revert_before,
+            revert_existed=revert_existed,
         )
         await self.broadcast(
             {
@@ -658,23 +738,97 @@ class AgentLoop:
             self.compressing = False
 
     async def _compress_body(self) -> None:
-        self.compressing = True
         self.stop_flag = False
         self.stop_event.clear()
         await self._set_state("running")
         try:
-            config = await get_llm()
-            if not config["base_url"].strip() or not config["model"].strip():
+            await self._compact_now("manual")
+        finally:
+            self.compressing = False
+            if self.state == "running":
+                await self._set_state("idle")
+
+    async def _context_snapshot(self) -> dict | None:
+        config = await get_llm()
+        session = await get_session(self.session_id)
+        if session is None:
+            return None
+        history = history_from(await list_messages(self.session_id))
+        summary = session["summary"] or ""
+        boundary = session["compacted_before_id"]
+        has_summary = bool(summary.strip() and boundary)
+        system = system_prompt(str(await self._root()), has_summary)
+        limit = int(config["context_limit"])
+        occupancy = context_occupancy(
+            history,
+            compacted_before_id=boundary,
+            system=system,
+            summary=summary,
+            tools=TOOLS,
+        )
+        return {
+            "config": config,
+            "history": history,
+            "summary": summary,
+            "boundary": boundary,
+            "system": system,
+            "limit": limit,
+            "occupancy": occupancy,
+        }
+
+    async def _context_usage(self) -> dict | None:
+        snap = await self._context_snapshot()
+        if snap is None:
+            return None
+        return {"chars": snap["occupancy"], "limit": snap["limit"]}
+
+    async def _publish_usage(self, chars: int, limit: int) -> None:
+        await self.broadcast({"type": "context.usage", "chars": chars, "limit": limit})
+
+    async def _pause_autocompact(self, message: str) -> None:
+        self.autocompact_paused = True
+        await self.broadcast({"type": "error", "message": message})
+
+    async def _compact_now(self, mode: str) -> str:
+        if mode == "auto" and self.autocompact_paused:
+            snap = await self._context_snapshot()
+            if snap is not None:
+                await self._publish_usage(snap["occupancy"], snap["limit"])
+            return "skipped"
+        if self.stop_flag and mode != "manual":
+            return "stop"
+        snap = await self._context_snapshot()
+        if snap is None:
+            return "skipped"
+        await self._publish_usage(snap["occupancy"], snap["limit"])
+        config = snap["config"]
+        if not config["base_url"].strip() or not config["model"].strip():
+            if mode != "auto":
                 await self.broadcast({"type": "error", "message": "请先在设置里填写模型"})
-                return
-            if await get_session(self.session_id) is None:
-                return
-            history = history_from(await list_messages(self.session_id))
-            older = summary_messages(history, config["context_turns"])
-            if older is None:
+            return "failed"
+        if mode == "auto" and not over_auto_threshold(snap["occupancy"], snap["limit"]):
+            return "skipped"
+        dropped = messages_to_fold(
+            snap["history"],
+            compacted_before_id=snap["boundary"],
+            context_limit=snap["limit"],
+            system=snap["system"],
+            tools=TOOLS,
+        )
+        if not dropped:
+            if mode == "manual":
                 await self.broadcast({"type": "error", "message": "没有更早的消息可压缩"})
-                return
-            await self.broadcast({"type": "compress.start"})
+                return "skipped"
+            if mode == "auto" and over_auto_threshold(snap["occupancy"], snap["limit"]):
+                await self._pause_autocompact("当前这一轮已经超过上下文上限的 90%，无法继续压缩")
+            return "blocked"
+        before = snap["occupancy"]
+        self.compressing = True
+        try:
+            if self.stop_flag:
+                await self.broadcast({"type": "error", "message": "已取消压缩"})
+                return "stop"
+            await self.broadcast({"type": "compress.start", "auto": mode == "auto"})
             chunks: list[str] = []
 
             async def on_delta(delta: dict) -> None:
@@ -691,7 +845,7 @@ class AgentLoop:
                 api_key=config["api_key"],
                 messages=[
                     {"role": "system", "content": compression_prompt()},
-                    {"role": "user", "content": compression_input(older)},
+                    {"role": "user", "content": compression_input(dropped, snap["summary"])},
                 ],
                 tools=None,
                 on_delta=on_delta,
@@ -700,20 +854,35 @@ class AgentLoop:
             summary = "".join(chunks).strip()
             if not summary:
                 await self.broadcast({"type": "error", "message": "总结为空"})
-                return
-            await set_summary(self.session_id, summary, older[-1].id)
+                if mode != "manual":
+                    self.autocompact_paused = True
+                return "failed"
+            await set_summary(self.session_id, summary, dropped[-1].id)
             await self.broadcast(
                 {
                     "type": "compress.done",
                     "summary": summary,
-                    "compacted_before_id": older[-1].id,
+                    "compacted_before_id": dropped[-1].id,
+                    "auto": mode == "auto",
                 }
             )
         except RunStopped:
             await self.broadcast({"type": "error", "message": "已取消压缩"})
+            return "stop"
         except ModelError as exc:
             await self.broadcast({"type": "error", "message": exc.message})
+            if mode != "manual":
+                self.autocompact_paused = True
+            return "failed"
         finally:
             self.compressing = False
-            if self.state == "running":
-                await self._set_state("idle")
+        again = await self._context_snapshot()
+        if again is None:
+            return "done"
+        await self._publish_usage(again["occupancy"], again["limit"])
+        if again["occupancy"] >= before:
+            if mode == "manual":
+                await self.broadcast({"type": "error", "message": "压缩后占用没有下降"})
+            else:
+                await self._pause_autocompact("压缩后占用没有下降，已停止自动压缩")
+        return "done"

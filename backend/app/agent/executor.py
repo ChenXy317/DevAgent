@@ -17,6 +17,28 @@ class RunStopped(Exception):
     pass
 
 
+def is_context_length_error(message: str) -> bool:
+    folded = message.lower()
+    needles = (
+        "context_length",
+        "context length",
+        "maximum context",
+        "max context",
+        "context window",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+        "exceeds the context",
+        "exceeded the context",
+        "token limit",
+        "上下文过长",
+        "超出上下文",
+        "上下文长度",
+        "上下文窗口",
+    )
+    return any(needle in folded or needle in message for needle in needles)
+
+
 _transport: httpx.AsyncBaseTransport | None = None
 
 
@@ -105,8 +127,7 @@ async def stream_chat(
                         with contextlib.suppress(asyncio.CancelledError):
                             await task
                     if stop is not None and stop.is_set():
-                        if read_task not in done:
-                            raise RunStopped()
+                        raise RunStopped()
                     if read_task not in done:
                         raise RunStopped()
                     line = read_task.result()
